@@ -1,0 +1,17 @@
+.env
+.venv/
+.uv-cache/
+.uv-python/
+.pytest_cache/
+.mypy_cache/
+.test-codex-tmp/
+.test-analytics-files/
+.test-analytics-run/
+.codex-smoke/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+*.session
+*.session-journal
+.coverage
+htmlcov/
