@@ -44,6 +44,54 @@ class ResearchCluster(StrictModel):
     sentiment: Literal["bullish", "bearish", "neutral", "mixed", "unknown"]
     possible_triggers: list[ResearchClaim]
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_redundant_fields(cls, value: object) -> object:
+        """Reconcile only mechanical contradictions in model-labelled data.
+
+        Group count is derived from groups; repeated IDs cannot create extra
+        independent sources. Claim kind, not its array position, determines
+        whether a model-labelled statement is a fact. No quote or reference
+        is fabricated or discarded.
+        """
+
+        if not isinstance(value, dict):
+            return value
+        result = dict(value)
+        groups = result.get("independent_source_groups")
+        if isinstance(groups, list) and all(
+            isinstance(group, list) and all(isinstance(ref, str) for ref in group)
+            for group in groups
+        ):
+            seen: set[str] = set()
+            unique_groups: list[list[str]] = []
+            for group in groups:
+                unique: list[str] = []
+                for ref in group:
+                    if ref not in seen:
+                        unique.append(ref)
+                        seen.add(ref)
+                if unique:
+                    unique_groups.append(unique)
+            result["independent_source_groups"] = unique_groups
+            result["independent_source_count"] = len(unique_groups)
+
+        facts = result.get("facts")
+        interpretations = result.get("interpretations")
+        if isinstance(facts, list) and isinstance(interpretations, list):
+            def kind_of(claim: object) -> object:
+                if isinstance(claim, dict):
+                    return claim.get("kind")
+                return getattr(claim, "kind", None)
+
+            result["facts"] = [
+                claim for claim in [*facts, *interpretations] if kind_of(claim) == "fact"
+            ]
+            result["interpretations"] = [
+                claim for claim in [*facts, *interpretations] if kind_of(claim) != "fact"
+            ]
+        return result
+
     @model_validator(mode="after")
     def check_claims(self) -> "ResearchCluster":
         if self.independent_source_count != len(self.independent_source_groups):

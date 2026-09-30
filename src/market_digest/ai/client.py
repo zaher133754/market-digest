@@ -215,6 +215,23 @@ class CodexCliClient:
                     if isinstance(exc, ValidationError)
                     else []
                 )
+                known_reasons = (
+                    "Independent count must equal origin groups, not messages",
+                    "Independent source groups must be nonempty and disjoint",
+                    "Unknown origin reference",
+                    "Facts cannot contain opinions or forecasts",
+                )
+                validation_reasons = (
+                    [
+                        next(
+                            (reason for reason in known_reasons if reason in issue["msg"]),
+                            issue["type"],
+                        )
+                        for issue in exc.errors()[:5]
+                    ]
+                    if isinstance(exc, ValidationError)
+                    else []
+                )
                 logger.error(
                     "codex_cli_contract_failed",
                     operation=operation,
@@ -222,6 +239,7 @@ class CodexCliClient:
                     reason="schema_validation",
                     failure_type=type(exc).__name__,
                     validation_locations=locations,
+                    validation_reasons=validation_reasons,
                     output_bytes=output_path.stat().st_size,
                 )
                 raise LunaContractError(

@@ -279,6 +279,35 @@ def test_extraction_batch_limit_keeps_all_large_corpus_parts():
     assert [part for batch in batches for part in batch] == parts
 
 
+def test_research_cluster_reconciles_only_redundant_model_fields():
+    raw = cluster().model_dump(mode="json")
+    raw["independent_source_groups"] = [["channel:1", "channel:1"], ["channel:1"]]
+    raw["independent_source_count"] = 3
+    raw["facts"].append(
+        ResearchClaim(
+            text="Участник решил не покупать.",
+            kind="source_opinion",
+            evidence=[Evidence(message_ref="chat:1", quote="Сегодня не покупаю.")],
+        ).model_dump(mode="json")
+    )
+    raw["interpretations"].append(raw["facts"][0])
+    repaired = ResearchCluster.model_validate(raw)
+    assert repaired.independent_source_groups == [["channel:1"]]
+    assert repaired.independent_source_count == 1
+    assert all(claim.kind == "fact" for claim in repaired.facts)
+    assert any(claim.kind == "source_opinion" for claim in repaired.interpretations)
+    assert sum(len(items) for items in (repaired.facts, repaired.interpretations)) == sum(
+        len(raw[name]) for name in ("facts", "interpretations")
+    )
+
+
+def test_research_cluster_still_rejects_invented_origin_reference():
+    raw = cluster().model_dump(mode="json")
+    raw["independent_source_groups"] = [["not-in-cluster"]]
+    with pytest.raises(ValueError, match="Unknown origin reference"):
+        ResearchCluster.model_validate(raw)
+
+
 @pytest.mark.asyncio
 async def test_extraction_contract_error_identifies_stage(settings, tmp_path):
     with pytest.raises(LunaContractError, match="research-extract-0"):
