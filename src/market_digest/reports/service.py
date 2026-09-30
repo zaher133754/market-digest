@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+import structlog
+
 from market_digest.config import Settings
 from market_digest.errors import LunaContractError, LunaUnavailableError
 from market_digest.telegram.folders import TelegramFolderNotFound
@@ -28,6 +30,7 @@ from .state import JsonStateStore, RunRecord, RunStatus, RuntimeState
 
 Publish = Callable[[str], Awaitable[Any] | Any]
 HealthProbe = Callable[[], Awaitable["HealthSnapshot"]]
+logger = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +254,16 @@ class ReportOrchestrator:
             raise
         except Exception as exc:
             error_code = _safe_error_code(exc)
+            logger.error(
+                "report_generation_failed",
+                report_kind=kind.value,
+                trigger=trigger.value,
+                error_code=error_code,
+                error_type=type(exc).__name__,
+                contract_detail=str(exc) if isinstance(exc, LunaContractError) else None,
+                source_count=source_count,
+                message_count=message_count,
+            )
             with suppress(Exception):
                 await self._record_failure(
                     kind,

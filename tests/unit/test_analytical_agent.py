@@ -22,6 +22,7 @@ from market_digest.reports.analysis_models import (
 )
 from market_digest.reports.analytical_pipeline import (
     AnalyticalPipeline,
+    pack,
     split_messages,
     validate_memo,
     validate_merge,
@@ -268,6 +269,20 @@ def test_oversized_message_split_is_lossless():
     parts = split_messages(data.model_copy(update={"messages": [m]}), 20000)
     assert len(parts) > 1
     assert "".join(p["text"] for p in parts) == text
+
+
+def test_extraction_batch_limit_keeps_all_large_corpus_parts():
+    parts = [{"part_id": f"part-{i}", "text": "сообщение"} for i in range(2760)]
+    batches = pack(parts, 218_000, max_items=120)
+    assert len(batches) == 23
+    assert max(map(len, batches)) == 120
+    assert [part for batch in batches for part in batch] == parts
+
+
+@pytest.mark.asyncio
+async def test_extraction_contract_error_identifies_stage(settings, tmp_path):
+    with pytest.raises(LunaContractError, match="research-extract-0"):
+        await pipeline(settings, tmp_path, FakeResearch(omit=True)).analyze(corpus())
 
 
 @pytest.mark.asyncio

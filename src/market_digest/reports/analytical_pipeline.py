@@ -64,26 +64,31 @@ class AnalyticalPipeline:
         ]
         clusters: list[ResearchCluster] = []
         parts = split_messages(data, budget)
-        for index, batch in enumerate(pack(parts, budget - 2000)):
-            result = await self.research.parse(
-                operation=f"research-extract-{index}",
-                system_prompt=prompts.EXTRACT,
-                payload=encode({"parts": batch}),
-                schema=Extraction,
-            )
-            ids = [p["part_id"] for p in batch]
-            if Counter(d.part_id for d in result.dispositions) != Counter(ids):
-                raise LunaContractError("Extraction lost or duplicated message parts")
-            part_refs = {p["part_id"]: p["message_ref"] for p in batch}
-            covered = {ref for c in result.clusters for ref in c.message_refs}
-            for disposition in result.dispositions:
-                if disposition.classification in ("useful", "duplicate"):
-                    if part_refs[disposition.part_id] not in covered:
-                        raise LunaContractError("Useful message omitted from research")
-            for n, cluster in enumerate(result.clusters):
-                cluster = cluster.model_copy(update={"cluster_id": f"e{index}-{n}"})
-                validate_clusters([cluster], data, set(part_refs.values()))
-                clusters.append(cluster)
+        # Structured output grows with the number of dispositions, not only
+        # with input characters. Bound both dimensions without dropping parts.
+        for index, batch in enumerate(pack(parts, budget - 2000, max_items=120)):
+            try:
+                result = await self.research.parse(
+                    operation=f"research-extract-{index}",
+                    system_prompt=prompts.EXTRACT,
+                    payload=encode({"parts": batch}),
+                    schema=Extraction,
+                )
+                ids = [p["part_id"] for p in batch]
+                if Counter(d.part_id for d in result.dispositions) != Counter(ids):
+                    raise LunaContractError("Extraction lost or duplicated message parts")
+                part_refs = {p["part_id"]: p["message_ref"] for p in batch}
+                covered = {ref for c in result.clusters for ref in c.message_refs}
+                for disposition in result.dispositions:
+                    if disposition.classification in ("useful", "duplicate"):
+                        if part_refs[disposition.part_id] not in covered:
+                            raise LunaContractError("Useful message omitted from research")
+                for n, cluster in enumerate(result.clusters):
+                    cluster = cluster.model_copy(update={"cluster_id": f"e{index}-{n}"})
+                    validate_clusters([cluster], data, set(part_refs.values()))
+                    clusters.append(cluster)
+            except LunaContractError as exc:
+                raise LunaContractError(f"research-extract-{index}: {exc}") from exc
         if not clusters:
             return None
 
@@ -323,13 +328,20 @@ def split_messages(data: ReportInput, budget: int) -> list[dict[str, Any]]:
     return parts
 
 
-def pack(items: list[dict[str, Any]], budget: int) -> list[list[dict[str, Any]]]:
+def pack(
+    items: list[dict[str, Any]], budget: int, *, max_items: int | None = None
+) -> list[list[dict[str, Any]]]:
+    if max_items is not None and max_items < 1:
+        raise ValueError("max_items must be positive")
     groups: list[list[dict[str, Any]]] = []
     group: list[dict[str, Any]] = []
     for item in items:
         if len(encode([item])) > budget:
             raise LunaContractError("Structured item exceeds context budget; nothing truncated")
-        if group and len(encode([*group, item])) > budget:
+        if group and (
+            (max_items is not None and len(group) >= max_items)
+            or len(encode([*group, item])) > budget
+        ):
             groups.append(group)
             group = []
         group.append(item)

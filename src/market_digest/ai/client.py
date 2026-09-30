@@ -183,14 +183,47 @@ class CodexCliClient:
                     f"Codex CLI failed during {operation} with exit code {process.returncode}"
                 )
             if not output_path.is_file():
+                logger.error(
+                    "codex_cli_contract_failed",
+                    operation=operation,
+                    model=self.model,
+                    reason="missing_output",
+                )
                 raise LunaContractError(
                     f"Codex CLI returned no structured output during {operation}"
                 )
             if output_path.stat().st_size > self._settings.codex_max_output_bytes:
+                logger.error(
+                    "codex_cli_contract_failed",
+                    operation=operation,
+                    model=self.model,
+                    reason="output_limit",
+                    output_bytes=output_path.stat().st_size,
+                )
                 raise LunaContractError(f"Codex CLI output exceeded limit during {operation}")
             try:
                 parsed = schema.model_validate_json(output_path.read_bytes())
             except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+                # Never log the model response or Pydantic input values: they
+                # can contain private Telegram messages. Locations and error
+                # categories are sufficient to diagnose schema failures.
+                locations = (
+                    [
+                        ".".join(map(str, issue["loc"]))
+                        for issue in exc.errors()[:5]
+                    ]
+                    if isinstance(exc, ValidationError)
+                    else []
+                )
+                logger.error(
+                    "codex_cli_contract_failed",
+                    operation=operation,
+                    model=self.model,
+                    reason="schema_validation",
+                    failure_type=type(exc).__name__,
+                    validation_locations=locations,
+                    output_bytes=output_path.stat().st_size,
+                )
                 raise LunaContractError(
                     f"{self.model} violated {schema.__name__} during {operation}"
                 ) from exc
