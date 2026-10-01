@@ -84,3 +84,39 @@ async def test_main_menu_button_returns_immediate_backend_text(
 
     assert backend.calls == [expected_call]
     assert message.answers == [(expected_answer, {})]
+
+
+@pytest.mark.asyncio
+async def test_failure_notice_uses_fresh_bot_after_primary_send_error(monkeypatch) -> None:
+    primary = object()
+    fallback = object()
+    sent_with: list[object] = []
+
+    async def fake_send(bot, chat_id, text):
+        assert chat_id == 42
+        assert text == "Проверка уведомления"
+        sent_with.append(bot)
+        if bot is primary:
+            raise RuntimeError("closed session")
+        return [123]
+
+    class FreshBot:
+        def __init__(self, *, token):
+            assert token == "test-token"
+
+        async def __aenter__(self):
+            return fallback
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(bot_module, "send_in_chunks", fake_send)
+    monkeypatch.setattr(bot_module, "Bot", FreshBot)
+    transport = bot_module.TelegramDigestBot(
+        bot_module.TelegramBotConfig(token="test-token", owner_telegram_id=42),
+        FakeBackend(),
+        bot=primary,  # type: ignore[arg-type]
+    )
+
+    assert await transport.publish_failure("Проверка уведомления") == [123]
+    assert sent_with == [primary, fallback]

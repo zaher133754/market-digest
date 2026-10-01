@@ -171,3 +171,36 @@ async def test_failure_records_only_safe_code_and_sends_no_partial_report(
     assert "RAW SECRET MESSAGE" not in published[0]
     assert "internal_error" in published[0]
     await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_scheduled_failure_uses_dedicated_notification_sender(settings, tmp_path) -> None:
+    loader = FakeLoader()
+    pipeline = BlockingPipeline(error=RuntimeError("RAW SECRET MESSAGE"))
+    regular_reports: list[str] = []
+    alerts: list[str] = []
+    store = JsonStateStore(tmp_path / "state.json")
+    orchestrator = ReportOrchestrator(
+        settings,
+        loader,
+        pipeline,
+        store,
+        publish=regular_reports.append,
+        failure_publish=alerts.append,
+        health_probe=_health,
+    )
+
+    await orchestrator.request(ReportKind.DIGEST, RunTrigger.SCHEDULED)
+    await loader.called.wait()
+    pipeline.release.set()
+    for _ in range(100):
+        if alerts:
+            break
+        await asyncio.sleep(0.01)
+
+    assert regular_reports == []
+    assert len(alerts) == 1
+    assert "internal_error" in alerts[0]
+    assert "RAW SECRET MESSAGE" not in alerts[0]
+    assert (await store.load()).digest.status is RunStatus.FAILED
+    await orchestrator.shutdown()

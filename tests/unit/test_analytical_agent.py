@@ -22,6 +22,8 @@ from market_digest.reports.analysis_models import (
 )
 from market_digest.reports.analytical_pipeline import (
     AnalyticalPipeline,
+    align_cluster_quotes,
+    exact_quote_span,
     pack,
     split_messages,
     validate_memo,
@@ -175,6 +177,38 @@ class FakeResearch:
         raise AssertionError(schema)
 
 
+class RepairingResearch(FakeResearch):
+    async def parse(self, *, operation, system_prompt, payload, schema):
+        if operation.startswith("research-repair-"):
+            self.fabricated = False
+        return await super().parse(
+            operation=operation,
+            system_prompt=system_prompt,
+            payload=payload,
+            schema=schema,
+        )
+
+
+class RepairingOmittedResearch(FakeResearch):
+    async def parse(self, *, operation, system_prompt, payload, schema):
+        if operation == "research-extract-0":
+            body = json.loads(payload)
+            self.calls.append((operation, body))
+            return Extraction(
+                dispositions=[
+                    Disposition(part_id=p["part_id"], classification="useful", reason="рынок")
+                    for p in body["parts"]
+                ],
+                clusters=[],
+            )
+        return await super().parse(
+            operation=operation,
+            system_prompt=system_prompt,
+            payload=payload,
+            schema=schema,
+        )
+
+
 class FakeAnalyst:
     def __init__(self, error=None):
         self.error = error
@@ -269,6 +303,53 @@ def test_oversized_message_split_is_lossless():
     parts = split_messages(data.model_copy(update={"messages": [m]}), 20000)
     assert len(parts) > 1
     assert "".join(p["text"] for p in parts) == text
+
+
+def test_quote_alignment_changes_only_whitespace():
+    assert exact_quote_span("Ставка\nсохранена.", "Ставка сохранена.") == "Ставка\nсохранена."
+    assert exact_quote_span("Ставка сохранена.", "Ставка снижена.") is None
+    raw = cluster()
+    changed = raw.model_copy(
+        update={
+            "facts": [
+                raw.facts[0].model_copy(
+                    update={
+                        "evidence": [
+                            raw.facts[0].evidence[0].model_copy(
+                                update={"quote": "Ставка\nсохранена."}
+                            )
+                        ]
+                    }
+                )
+            ]
+        }
+    )
+    repaired = align_cluster_quotes(changed, {"channel:1": "Ставка сохранена."})
+    assert repaired.facts[0].evidence[0].quote == "Ставка сохранена."
+
+
+@pytest.mark.asyncio
+async def test_fabricated_quote_reprocessed_only_once_with_luna(settings, tmp_path):
+    research = RepairingResearch(fabricated=True)
+    result = await pipeline(settings, tmp_path, research=research).analyze(corpus())
+    assert result is not None
+    assert [operation for operation, _ in research.calls if operation.startswith("research-")] == [
+        "research-extract-0",
+        "research-repair-0",
+        "research-merge-0-0",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_useful_messages_missing_from_clusters_are_reprocessed(settings, tmp_path):
+    research = RepairingOmittedResearch()
+    result = await pipeline(settings, tmp_path, research=research).analyze(corpus())
+    assert result is not None
+    assert [operation for operation, _ in research.calls if operation.startswith("research-")] == [
+        "research-extract-0",
+        "research-repair-0",
+        "research-merge-0-0",
+    ]
 
 
 def test_extraction_batch_limit_keeps_all_large_corpus_parts():

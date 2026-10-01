@@ -59,12 +59,14 @@ class ReportOrchestrator:
         *,
         publish: Publish,
         health_probe: HealthProbe,
+        failure_publish: Publish | None = None,
     ) -> None:
         self._settings = settings
         self._loader = loader
         self._pipeline = pipeline
         self._state_store = state_store
         self._publish = publish
+        self._failure_publish = failure_publish or publish
         self._health_probe = health_probe
         self._task_lock = asyncio.Lock()
         self._state_lock = asyncio.Lock()
@@ -273,10 +275,22 @@ class ReportOrchestrator:
                     message_count,
                     error_code,
                 )
-            with suppress(Exception):
+            try:
                 await _call_publish(
-                    self._publish,
+                    self._failure_publish,
                     f"⚠️ Не удалось сформировать {_kind_name(kind)}. Код ошибки: {error_code}.",
+                )
+                logger.info(
+                    "report_failure_notification_sent",
+                    report_kind=kind.value,
+                    trigger=trigger.value,
+                )
+            except Exception as delivery_error:
+                logger.error(
+                    "report_failure_notification_failed",
+                    report_kind=kind.value,
+                    trigger=trigger.value,
+                    error_type=type(delivery_error).__name__,
                 )
         finally:
             async with self._task_lock:

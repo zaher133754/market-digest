@@ -118,6 +118,9 @@ async def run_app(settings: Settings) -> None:
     async def publish(text: str) -> None:
         await bot_holder["bot"].publish_digest(text)
 
+    async def publish_failure(text: str) -> None:
+        await bot_holder["bot"].publish_failure(text)
+
     async def health_probe() -> HealthSnapshot:
         mtproto_available = await _mtproto_available(user_session.client)
         codex_available = await _codex_available(codex)
@@ -146,6 +149,7 @@ async def run_app(settings: Settings) -> None:
         pipeline,
         state_store,
         publish=publish,
+        failure_publish=publish_failure,
         health_probe=health_probe,
     )
     bot = TelegramDigestBot(_bot_config(settings), orchestrator)

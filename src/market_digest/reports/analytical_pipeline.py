@@ -1,8 +1,11 @@
 """Luna extraction/research -> Astra synthesis -> grounded Luna audit."""
 
 import json
+import re
 from collections import Counter
 from typing import Any
+
+import structlog
 
 from market_digest.ai.routing import ModelRoute
 from market_digest.config import Settings
@@ -23,6 +26,8 @@ from .analysis_models import (
 )
 from .history import ResearchHistory
 from .models import ReportInput
+
+logger = structlog.get_logger(__name__)
 
 
 def encode(value: Any) -> str:
@@ -68,24 +73,9 @@ class AnalyticalPipeline:
         # with input characters. Bound both dimensions without dropping parts.
         for index, batch in enumerate(pack(parts, budget - 2000, max_items=120)):
             try:
-                result = await self.research.parse(
-                    operation=f"research-extract-{index}",
-                    system_prompt=prompts.EXTRACT,
-                    payload=encode({"parts": batch}),
-                    schema=Extraction,
-                )
-                ids = [p["part_id"] for p in batch]
-                if Counter(d.part_id for d in result.dispositions) != Counter(ids):
-                    raise LunaContractError("Extraction lost or duplicated message parts")
-                part_refs = {p["part_id"]: p["message_ref"] for p in batch}
-                covered = {ref for c in result.clusters for ref in c.message_refs}
-                for disposition in result.dispositions:
-                    if disposition.classification in ("useful", "duplicate"):
-                        if part_refs[disposition.part_id] not in covered:
-                            raise LunaContractError("Useful message omitted from research")
-                for n, cluster in enumerate(result.clusters):
+                extracted = await self._extract_batch(batch, data, index)
+                for n, cluster in enumerate(extracted):
                     cluster = cluster.model_copy(update={"cluster_id": f"e{index}-{n}"})
-                    validate_clusters([cluster], data, set(part_refs.values()))
                     clusters.append(cluster)
             except LunaContractError as exc:
                 raise LunaContractError(f"research-extract-{index}: {exc}") from exc
@@ -166,6 +156,46 @@ class AnalyticalPipeline:
         # Save only audited research. It remains available if Telegram delivery fails.
         await self.history.save(snapshot)
         return AnalyticalResult(snapshot=snapshot, previous=previous)
+
+    async def _extract_batch(
+        self, batch: list[dict[str, Any]], data: ReportInput, index: int
+    ) -> list[ResearchCluster]:
+        result = await self.research.parse(
+            operation=f"research-extract-{index}",
+            system_prompt=prompts.EXTRACT,
+            payload=encode({"parts": batch}),
+            schema=Extraction,
+        )
+        valid, repair_refs, required_refs = inspect_extraction(result, batch, data)
+        if not repair_refs:
+            return valid
+
+        # Retry only messages affected by a missing cluster or an inexact
+        # quote. A second invalid answer fails closed; nothing is discarded.
+        repair_parts = [p for p in batch if p["message_ref"] in repair_refs]
+        logger.warning(
+            "research_extraction_repair_requested",
+            batch_index=index,
+            part_count=len(repair_parts),
+            message_count=len(repair_refs),
+        )
+        repaired = await self.research.parse(
+            operation=f"research-repair-{index}",
+            system_prompt=prompts.EXTRACT
+            + "\nЭто повторная проверка только спорных сообщений. Цитируй фрагменты "
+            "символ в символ из parts.text, сохраняй все полезные message_ref. "
+            "Если текст не подтверждает тезис, не включай этот тезис в кластер.",
+            payload=encode({"parts": repair_parts}),
+            schema=Extraction,
+        )
+        repair_valid, still_invalid, _ = inspect_extraction(repaired, repair_parts, data)
+        if still_invalid:
+            raise LunaContractError("Research repair did not ground all useful messages")
+        combined = [*valid, *repair_valid]
+        covered = {ref for cluster in combined for ref in cluster.message_refs}
+        if not required_refs <= covered:
+            raise LunaContractError("Research repair omitted an originally useful message")
+        return combined
 
     async def _merge(
         self, clusters: list[ResearchCluster], data: ReportInput
@@ -350,6 +380,77 @@ def pack(
     return groups
 
 
+def inspect_extraction(
+    result: Extraction, batch: list[dict[str, Any]], data: ReportInput
+) -> tuple[list[ResearchCluster], set[str], set[str]]:
+    """Keep grounded clusters and identify only the refs needing Luna repair."""
+
+    ids = [p["part_id"] for p in batch]
+    if Counter(d.part_id for d in result.dispositions) != Counter(ids):
+        raise LunaContractError("Extraction lost or duplicated message parts")
+    part_refs = {p["part_id"]: p["message_ref"] for p in batch}
+    allowed = set(part_refs.values())
+    messages = {m.message_ref: m.text for m in data.messages}
+    valid: list[ResearchCluster] = []
+    repair_refs: set[str] = set()
+    for cluster in result.clusters:
+        if not set(cluster.message_refs) <= allowed:
+            raise LunaContractError("Research contains unknown message references")
+        aligned = align_cluster_quotes(cluster, messages)
+        try:
+            validate_clusters([aligned], data, allowed)
+        except LunaContractError as exc:
+            if str(exc) != "Research fabricated a source quote":
+                raise
+            repair_refs.update(cluster.message_refs)
+        else:
+            valid.append(aligned)
+    covered = {ref for cluster in valid for ref in cluster.message_refs}
+    required = {
+        part_refs[d.part_id]
+        for d in result.dispositions
+        if d.classification in ("useful", "duplicate")
+    }
+    repair_refs.update(required - covered)
+    return valid, repair_refs, required
+
+
+def align_cluster_quotes(
+    cluster: ResearchCluster, messages: dict[str, str]
+) -> ResearchCluster:
+    """Restore exact source whitespace when a quote differs only by spacing."""
+
+    updates: dict[str, Any] = {}
+    for field in (
+        "facts",
+        "interpretations",
+        "bullish_arguments",
+        "bearish_arguments",
+        "neutral_arguments",
+        "possible_triggers",
+    ):
+        claims = []
+        for claim in getattr(cluster, field):
+            evidence = []
+            for item in claim.evidence:
+                source = messages.get(item.message_ref)
+                span = exact_quote_span(source, item.quote) if source is not None else None
+                evidence.append(item.model_copy(update={"quote": span}) if span else item)
+            claims.append(claim.model_copy(update={"evidence": evidence}))
+        updates[field] = claims
+    return cluster.model_copy(update=updates)
+
+
+def exact_quote_span(source: str, quote: str) -> str | None:
+    if quote in source:
+        return quote
+    words = re.split(r"\s+", quote.strip())
+    if len(words) < 2:
+        return None
+    match = re.search(r"\s+".join(re.escape(word) for word in words), source)
+    return match.group(0) if match else None
+
+
 def validate_clusters(
     clusters: list[ResearchCluster], data: ReportInput, allowed: set[str]
 ) -> None:
@@ -363,6 +464,8 @@ def validate_clusters(
             for evidence in claim.evidence:
                 if evidence.message_ref not in cluster.message_refs:
                     raise LunaContractError("Claim evidence is outside its cluster")
+                if evidence.message_ref not in messages:
+                    raise LunaContractError("Research contains unknown evidence reference")
                 if evidence.quote not in messages[evidence.message_ref].text:
                     raise LunaContractError("Research fabricated a source quote")
 

@@ -265,6 +265,19 @@ class TelegramDigestBot:
             text,
         )
 
+    async def publish_failure(self, text: str) -> list[int]:
+        """Try a fresh Bot session if the polling Bot cannot deliver an alert."""
+
+        try:
+            return await self.publish_digest(text)
+        except Exception as exc:
+            logger.warning(
+                "telegram_failure_notice_primary_send_failed",
+                extra={"error_type": type(exc).__name__},
+            )
+        async with Bot(token=self.config.token) as fallback:
+            return await send_in_chunks(fallback, self.config.owner_telegram_id, text)
+
 
 class OwnerFailureNotifier:
     """Callable protocol adapter suitable for collector and AI workers."""
